@@ -1,0 +1,19 @@
+# Makefile for assembling directories into PNGs
+
+# Find all directories matching workspace/*/????
+DIRS := $(shell find workspace -type d -regex ".*/[0-9][0-9][0-9][0-9]")
+
+# Corresponding output PNG files
+OUTPUTS := $(DIRS:%=%-output.png)
+
+.PHONY: all process
+
+# Default target: assemble all directories
+all: $(OUTPUTS)
+
+# Rule to assemble directory into PNG
+%-output.png:
+	if [ ! -f $@ ]; then python pagetool.py assemble $(@:workspace/%-output.png=workspace/%); fi
+
+# Alias for assembling all
+process: all

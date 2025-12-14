@@ -1,0 +1,19 @@
+# Makefile for processing texts.json files
+
+# Find all texts.json files in workspace/ukr-1/0[12]??/ directories
+TEXTS_JSON := $(shell find workspace/ukr-1 -regex ".*/0[12][0-9][0-9]/texts.json")
+
+# Corresponding backup files
+BACKUPS := $(TEXTS_JSON:.json=.json.backup)
+
+.PHONY: all process
+
+# Default target: process all texts.json files
+all: $(BACKUPS)
+
+# Rule to create backup from texts.json
+%.json.backup: %.json
+	if [ ! -f $@ ]; then python3 from_unicode.py $<; fi
+
+# Alias for processing all
+process: all

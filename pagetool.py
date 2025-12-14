@@ -11,18 +11,51 @@ from dataclasses import dataclass
 from functools import lru_cache
 from PIL import Image, ImageDraw, ImageFont
 from docling.document_converter import DocumentConverter
+from claude_text_removal import remove_text_pil
 
 
-def disassemble(png_path):
+
+
+
+def _resolve_disassemble_input(path: str) -> tuple[str, str]:
+    """
+    Resolve a disassemble input to an image path and an output base name.
+
+    Supports:
+    - direct .png files
+    - stems (foo -> foo.png)
+    - directories (dir -> dir.png if present, else dir/page.png)
+    """
+    if os.path.isdir(path):
+        as_png = path.rstrip("/\\") + ".png"
+        if os.path.exists(as_png):
+            return as_png, os.path.splitext(os.path.basename(as_png))[0]
+        page_png = os.path.join(path, "page.png")
+        if os.path.exists(page_png):
+            # Use directory name as the output folder base name, not "page".
+            return page_png, os.path.basename(os.path.normpath(path))
+        raise FileNotFoundError(f"Directory {path} does not contain {as_png} or page.png")
+
+    if os.path.exists(path) and path.lower().endswith(".png"):
+        return path, os.path.splitext(os.path.basename(path))[0]
+
+    as_png = path + ".png"
+    if os.path.exists(as_png):
+        return as_png, os.path.splitext(os.path.basename(as_png))[0]
+
+    raise FileNotFoundError(f"File {path} not found (also tried {as_png})")
+
+
+def disassemble(png_path: str, *, converter: DocumentConverter | None = None, output_base_name: str | None = None):
     """Disassemble PNG into directory with Docling data, texts, and images."""
     if not os.path.exists(png_path):
         raise FileNotFoundError(f"File {png_path} not found")
 
-    converter = DocumentConverter()
+    converter = converter or DocumentConverter()
     result = converter.convert(png_path)
     doc = result.document
 
-    base_name = os.path.splitext(os.path.basename(png_path))[0]
+    base_name = output_base_name or os.path.splitext(os.path.basename(png_path))[0]
     output_dir = os.path.join(os.path.dirname(png_path), base_name)
     os.makedirs(output_dir, exist_ok=True)
 
@@ -95,10 +128,18 @@ def disassemble(png_path):
     print(f"Disassembled {png_path} into {output_dir}/")
 
 
-def assemble(dir_path, *, debug: bool = False, base_image: str = "blank", font_family: str = "times"):
+def assemble(
+    dir_path,
+    *,
+    debug: bool = False,
+    base_image: str = "page",
+    font_family: str = "times",
+):
     """Assemble directory back into PNG."""
     if not os.path.isdir(dir_path):
         raise NotADirectoryError(f"Directory {dir_path} not found")
+
+    temp_counter = 1
 
     # Load Docling data for page size
     with open(os.path.join(dir_path, 'docling.json'), 'r') as f:
@@ -113,16 +154,14 @@ def assemble(dir_path, *, debug: bool = False, base_image: str = "blank", font_f
     width = int(page_size['width'])
     height = int(page_size['height'])
 
-    # Create output image
-    if base_image == "page":
-        page_path = os.path.join(dir_path, "page.png")
-        if os.path.exists(page_path):
-            img = Image.open(page_path).convert("RGB")
-            width, height = img.size
-        else:
-            img = Image.new("RGB", (width, height), "white")
+    # Start from original page when available so pictures/background are preserved.
+    page_path = os.path.join(dir_path, "page.png")
+    if base_image == "page" and os.path.exists(page_path):
+        img = Image.open(page_path).convert("RGB")
+        width, height = img.size
     else:
         img = Image.new("RGB", (width, height), "white")
+
     draw = ImageDraw.Draw(img)
 
     regular_font_path, bold_font_path = _pick_font_paths(font_family)
@@ -139,61 +178,58 @@ def assemble(dir_path, *, debug: bool = False, base_image: str = "blank", font_f
         else:  # TOPLEFT coordinates, no conversion needed
             return bbox
 
-    # Load and draw texts (fit to each bbox)
+    # Load pictures and texts
+    pictures = []
+    pictures_path = os.path.join(dir_path, "pictures.json")
+    if os.path.exists(pictures_path):
+        with open(pictures_path, "r") as f:
+            pictures = json.load(f)
+
+    texts = []
     texts_path = os.path.join(dir_path, 'texts.json')
     if os.path.exists(texts_path):
         with open(texts_path, 'r') as f:
             texts = json.load(f)
-        for text in texts:
-            bbox = convert_bbox(text['bbox'])
-            box = _to_int_box(bbox, width, height)
-            if debug:
-                draw.rectangle([box.l, box.t, box.r, box.b], outline="red", width=2)
 
-            pad_x = max(2, int(round(box.width * 0.01)))
-            pad_y = max(2, int(round(box.height * 0.02)))
-            max_size = max(8, min(96, box.height))
-            size, _, spacing = _fit_font_size(
-                draw,
-                text["text"],
-                box,
-                regular_font_path,
-                min_size=8,
-                max_size=max_size,
-                pad_x=pad_x,
-                pad_y=pad_y,
-                line_spacing_ratio=0.15,
-            )
-            _draw_text_in_box(
-                draw,
-                text["text"],
-                box,
-                regular_font_path,
-                font_size=size,
-                pad_x=pad_x,
-                pad_y=pad_y,
-                spacing=spacing,
-                fill="black",
-                align="left",
-                valign="top",
-            )
-
-    # Load and paste pictures
-    pictures_path = os.path.join(dir_path, 'pictures.json')
-    if os.path.exists(pictures_path):
-        with open(pictures_path, 'r') as f:
-            pictures = json.load(f)
+    # When assembling from a blank canvas, paste extracted pictures (if present).
+    if base_image == "blank":
         for pic in pictures:
-            img_file = os.path.join(dir_path, pic['img_file'])
+            img_file = os.path.join(dir_path, pic["img_file"])
             if os.path.exists(img_file):
-                pic_img = Image.open(img_file)
-                bbox = convert_bbox(pic['bbox'])
-                # Resize to fit bbox
-                pic_img = pic_img.resize((int(bbox['r'] - bbox['l']), int(bbox['b'] - bbox['t'])))
-                img.paste(pic_img, (int(bbox['l']), int(bbox['t'])))
+                pic_img = Image.open(img_file).convert("RGB")
+                bbox = convert_bbox(pic["bbox"])
+                box = _to_int_box(bbox, width, height)
+                if box.area <= 0:
+                    continue
+                pic_img = pic_img.resize((box.width, box.height))
+                img.paste(pic_img, (box.l, box.t))
+
+    # Pre-load tables to suppress text rendering in table areas
+    table_boxes: list[Box] = []
+    tables_path = os.path.join(dir_path, 'tables.json')
+    if os.path.exists(tables_path):
+        with open(tables_path, 'r') as f:
+            _tables_for_suppression = json.load(f)
+        for table in _tables_for_suppression:
+            table_bbox = convert_bbox(table['bbox'], 'BOTTOMLEFT')
+            table_boxes.append(_to_int_box(table_bbox, width, height))
+
+    def should_skip_text_box(box: Box) -> bool:
+        if not table_boxes or box.area <= 0:
+            return False
+        for tb in table_boxes:
+            inter = box.intersect(tb)
+            if inter.area <= 0:
+                continue
+            # If most of the text box is inside a table, do not render it here.
+            if inter.area / box.area >= 0.35:
+                return True
+        return False
+
+
 
     # Load and draw tables
-    tables_path = os.path.join(dir_path, 'tables.json')
+    tables_for_render: list[dict] = []
     if os.path.exists(tables_path):
         with open(tables_path, 'r') as f:
             tables = json.load(f)
@@ -204,77 +240,228 @@ def assemble(dir_path, *, debug: bool = False, base_image: str = "blank", font_f
             if debug:
                 draw.rectangle([table_box.l, table_box.t, table_box.r, table_box.b], outline="blue", width=3)
 
-            # Pick a single font size for the whole table that fits all cells
-            cell_boxes: list[tuple[Box, dict]] = []
-            min_text_cell_h = None
+            # Prepare and clean cells:
+            # - Clip to table bbox
+            # - Drop "container" cells that fully contain multiple other cells (Docling sometimes emits these)
+            raw_cells: list[tuple[Box, dict]] = []
             for cell in table["table_cells"]:
                 cell_bbox = convert_bbox(cell["bbox"], "TOPLEFT")
-                cell_box = _to_int_box(cell_bbox, width, height)
-                cell_boxes.append((cell_box, cell))
+                cell_box = _to_int_box(cell_bbox, width, height).intersect(table_box)
+                if cell_box.area <= 0:
+                    continue
+                raw_cells.append((cell_box, cell))
+
+            def contains_ratio(outer: Box, inner: Box) -> float:
+                if inner.area <= 0:
+                    return 0.0
+                return outer.intersect(inner).area / inner.area
+
+            container_idxs: set[int] = set()
+            for i, (box_i, cell_i) in enumerate(raw_cells):
+                txt_i = (cell_i.get("text") or "").strip()
+                if not txt_i or box_i.area <= 0:
+                    continue
+                contained: list[int] = []
+                for j, (box_j, cell_j) in enumerate(raw_cells):
+                    if i == j:
+                        continue
+                    txt_j = (cell_j.get("text") or "").strip()
+                    if not txt_j or box_j.area <= 0:
+                        continue
+                    if contains_ratio(box_i, box_j) >= 0.95:
+                        contained.append(j)
+                if len(contained) >= 2:
+                    container_idxs.add(i)
+
+            cells: list[tuple[Box, dict]] = [(b, c) for idx, (b, c) in enumerate(raw_cells) if idx not in container_idxs]
+
+            # Build a grid from the remaining cells and draw table lines.
+            x_edges = [table_box.l, table_box.r]
+            y_edges = [table_box.t, table_box.b]
+            for cb, _ in cells:
+                x_edges.extend([cb.l, cb.r])
+                y_edges.extend([cb.t, cb.b])
+
+            x_grid = _cluster_positions(x_edges, tol=3)
+            y_grid = _cluster_positions(y_edges, tol=3)
+
+            # Ensure table bbox edges are present.
+            if table_box.l not in x_grid:
+                x_grid.append(table_box.l)
+            if table_box.r not in x_grid:
+                x_grid.append(table_box.r)
+            if table_box.t not in y_grid:
+                y_grid.append(table_box.t)
+            if table_box.b not in y_grid:
+                y_grid.append(table_box.b)
+            x_grid = sorted(set(x_grid))
+            y_grid = sorted(set(y_grid))
+
+            # Snap cell boxes to the detected grid (reduces overlaps and misaligned boundaries).
+            snapped_cells: list[tuple[Box, dict]] = []
+            min_text_cell_h = None
+            for cb, cell in cells:
+                snapped = Box(
+                    _snap_to_positions(cb.l, x_grid),
+                    _snap_to_positions(cb.t, y_grid),
+                    _snap_to_positions(cb.r, x_grid),
+                    _snap_to_positions(cb.b, y_grid),
+                ).intersect(table_box)
+                if snapped.area <= 0:
+                    continue
+                snapped_cells.append((snapped, cell))
                 txt = (cell.get("text") or "").strip()
                 if txt:
-                    if min_text_cell_h is None or cell_box.height < min_text_cell_h:
-                        min_text_cell_h = cell_box.height
+                    if min_text_cell_h is None or snapped.height < min_text_cell_h:
+                        min_text_cell_h = snapped.height
+
+
 
             min_text_cell_h = min_text_cell_h or 1
             table_max_size = max(8, min(56, int(round(min_text_cell_h * 0.9))))
 
-            def table_fits(size: int) -> bool:
-                font = _load_font(regular_font_path, size)
-                spacing = max(0, int(round(size * 0.05)))
-                for cell_box, cell in cell_boxes:
-                    txt = (cell.get("text") or "").strip()
-                    if not txt:
-                        continue
-                    pad_x = min(6, max(2, int(round(cell_box.width * 0.02))))
-                    pad_y = min(6, max(2, int(round(cell_box.height * 0.08))))
-                    ok, _ = _layout_fits(draw, txt, font, cell_box, pad_x, pad_y, spacing)
-                    if not ok:
-                        return False
-                return True
+            tables_for_render.append(
+                {
+                    "table_box": table_box,
+                    "x_grid": x_grid,
+                    "y_grid": y_grid,
+                    "snapped_cells": snapped_cells,
+                    "table_max_size": table_max_size,
+                }
+            )
 
-            lo, hi = 8, table_max_size
-            best = lo
-            while lo <= hi:
-                mid = (lo + hi) // 2
-                if table_fits(mid):
-                    best = mid
-                    lo = mid + 1
-                else:
-                    hi = mid - 1
 
-            table_font_size = best
-            table_spacing = max(0, int(round(table_font_size * 0.05)))
-            
-            # Draw table cells
-            for cell_box, cell in cell_boxes:
-                # Render a light grid to preserve table structure (Docling often provides cell bboxes).
-                draw.rectangle([cell_box.l, cell_box.t, cell_box.r, cell_box.b], outline="#c9c9c9", width=1)
-                if debug:
-                    draw.rectangle([cell_box.l, cell_box.t, cell_box.r, cell_box.b], outline="lightblue", width=1)
 
+    # Render tables (grid + text) after erases so lines are preserved.
+    for tdata in tables_for_render:
+        table_box: Box = tdata["table_box"]
+        x_grid: list[int] = tdata["x_grid"]
+        y_grid: list[int] = tdata["y_grid"]
+        snapped_cells: list[tuple[Box, dict]] = tdata["snapped_cells"]
+        table_max_size: int = tdata["table_max_size"]
+
+        # Draw grid lines (outer border heavier).
+        line_color = "#666666"
+        for x in x_grid:
+            w = 2 if x in (table_box.l, table_box.r) else 1
+            draw.line([(x, table_box.t), (x, table_box.b)], fill=line_color, width=w)
+        for y in y_grid:
+            w = 2 if y in (table_box.t, table_box.b) else 1
+            draw.line([(table_box.l, y), (table_box.r, y)], fill=line_color, width=w)
+
+        def table_fits(size: int) -> bool:
+            font = _load_font(regular_font_path, size)
+            spacing = max(0, int(round(size * 0.05)))
+            for cell_box, cell in snapped_cells:
                 txt = (cell.get("text") or "").strip()
                 if not txt:
                     continue
-
-                is_header = bool(cell.get("column_header") or cell.get("row_header"))
-                font_path = bold_font_path if is_header else regular_font_path
                 pad_x = min(6, max(2, int(round(cell_box.width * 0.02))))
                 pad_y = min(6, max(2, int(round(cell_box.height * 0.08))))
+                ok, _ = _layout_fits(draw, txt, font, cell_box, pad_x, pad_y, spacing)
+                if not ok:
+                    return False
+            return True
 
-                _draw_text_in_box(
-                    draw,
-                    txt,
-                    cell_box,
-                    font_path,
-                    font_size=table_font_size,
-                    pad_x=pad_x,
-                    pad_y=pad_y,
-                    spacing=table_spacing,
-                    fill="black",
-                    align="center" if is_header else "left",
-                    valign="middle",
-                )
+        lo, hi = 8, table_max_size
+        best = lo
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if table_fits(mid):
+                best = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+
+        table_font_size = best
+        table_spacing = max(0, int(round(table_font_size * 0.05)))
+
+        for cell_box, cell in snapped_cells:
+            if debug:
+                draw.rectangle([cell_box.l, cell_box.t, cell_box.r, cell_box.b], outline="lightblue", width=1)
+            txt = (cell.get("text") or "").strip()
+            if not txt:
+                continue
+
+            # Clean the cell area before drawing text
+            crop = img.crop((cell_box.l, cell_box.t, cell_box.r, cell_box.b))
+            crop.save(os.path.join(dir_path, f'temp-{temp_counter:04d}.png'))
+            cleaned_crop = remove_text_pil(crop)
+            cleaned_crop.save(os.path.join(dir_path, f'temp-{temp_counter:04d}-cleaned.png'))
+            img.paste(cleaned_crop, (cell_box.l, cell_box.t))
+            temp_counter += 1
+
+            is_header = bool(cell.get("column_header") or cell.get("row_header"))
+            font_path = bold_font_path if is_header else regular_font_path
+            pad_x = min(6, max(2, int(round(cell_box.width * 0.02))))
+            pad_y = min(6, max(2, int(round(cell_box.height * 0.08))))
+
+            _draw_text_in_box(
+                draw,
+                txt,
+                cell_box,
+                font_path,
+                font_size=table_font_size,
+                pad_x=pad_x,
+                pad_y=pad_y,
+                spacing=table_spacing,
+                fill="black",
+                align="center" if is_header else "left",
+                valign="middle",
+            )
+
+    # Clean text regions before drawing new text
+    for text in texts:
+        bbox = convert_bbox(text["bbox"])
+        box = _to_int_box(bbox, width, height)
+        if should_skip_text_box(box):
+            continue
+        # Extract sub-image
+        crop = img.crop((box.l, box.t, box.r, box.b))
+        crop.save(os.path.join(dir_path, f'temp-{temp_counter:04d}.png'))
+        # Clean it
+        cleaned_crop = remove_text_pil(crop)
+        cleaned_crop.save(os.path.join(dir_path, f'temp-{temp_counter:04d}-cleaned.png'))
+        # Paste back
+        img.paste(cleaned_crop, (box.l, box.t))
+        temp_counter += 1
+
+    # Draw all (non-table) texts.
+    for text in texts:
+        bbox = convert_bbox(text["bbox"])
+        box = _to_int_box(bbox, width, height)
+        if should_skip_text_box(box):
+            continue
+        if debug:
+            draw.rectangle([box.l, box.t, box.r, box.b], outline="red", width=2)
+
+        pad_x = max(2, int(round(box.width * 0.01)))
+        pad_y = max(2, int(round(box.height * 0.02)))
+        max_size = max(8, min(96, box.height))
+        size, _, spacing = _fit_font_size(
+            draw,
+            text["text"],
+            box,
+            regular_font_path,
+            min_size=8,
+            max_size=max_size,
+            pad_x=pad_x,
+            pad_y=pad_y,
+            line_spacing_ratio=0.15,
+        )
+        _draw_text_in_box(
+            draw,
+            text["text"],
+            box,
+            regular_font_path,
+            font_size=size,
+            pad_x=pad_x,
+            pad_y=pad_y,
+            spacing=spacing,
+            fill="black",
+            align="left",
+            valign="top",
+        )
 
     # Save the assembled image
     output_path = dir_path.rstrip('/') + '-output.png'
@@ -298,8 +485,15 @@ class Box:
     def height(self) -> int:
         return max(0, self.b - self.t)
 
+    @property
+    def area(self) -> int:
+        return self.width * self.height
+
     def inset(self, pad_x: int, pad_y: int) -> "Box":
         return Box(self.l + pad_x, self.t + pad_y, self.r - pad_x, self.b - pad_y)
+
+    def intersect(self, other: "Box") -> "Box":
+        return Box(max(self.l, other.l), max(self.t, other.t), min(self.r, other.r), min(self.b, other.b))
 
 
 def _clamp(v: int, lo: int, hi: int) -> int:
@@ -514,27 +708,59 @@ def _draw_text_in_box(
         y += lh
 
 
+def _cluster_positions(values: list[int], tol: int) -> list[int]:
+    if not values:
+        return []
+    values = sorted(values)
+    clusters: list[list[int]] = [[values[0]]]
+    for v in values[1:]:
+        if abs(v - clusters[-1][-1]) <= tol:
+            clusters[-1].append(v)
+        else:
+            clusters.append([v])
+    centers = [int(round(sum(c) / len(c))) for c in clusters]
+    return sorted(set(centers))
+
+
+def _snap_to_positions(v: int, positions: list[int]) -> int:
+    if not positions:
+        return v
+    return min(positions, key=lambda p: abs(p - v))
+
+
+
+
+
 def main():
     parser = argparse.ArgumentParser(description="Page tool for disassembling and assembling images using Docling")
     subparsers = parser.add_subparsers(dest='command', help='Available commands')
 
     # Disassemble command
     disassemble_parser = subparsers.add_parser('disassemble', help='Disassemble PNG into components')
-    disassemble_parser.add_argument('png_path', help='Path to the PNG file')
+    disassemble_parser.add_argument('inputs', nargs='+', help='PNG file(s), stems, or directories')
 
     # Assemble command
     assemble_parser = subparsers.add_parser('assemble', help='Assemble directory back into PNG')
     assemble_parser.add_argument('dir_path', help='Path to the directory containing disassembled components')
     assemble_parser.add_argument('--debug', action='store_true', help='Draw debug bounding boxes')
-    assemble_parser.add_argument('--base-image', choices=['blank', 'page'], default='blank', help='Start from blank or original page.png')
+    assemble_parser.add_argument('--base-image', choices=['blank', 'page'], default='page', help='Start from blank or original page.png')
     assemble_parser.add_argument('--font', choices=['times', 'georgia', 'arial'], default='times', help='Font family for rendered text')
 
     args = parser.parse_args()
 
     if args.command == 'disassemble':
-        disassemble(args.png_path)
+        # Reuse a single converter instance to avoid repeated OCR/tesseract startup costs.
+        converter = DocumentConverter()
+        for inp in args.inputs:
+            png_path, base_name = _resolve_disassemble_input(inp)
+            disassemble(png_path, converter=converter, output_base_name=base_name)
     elif args.command == 'assemble':
-        assemble(args.dir_path, debug=args.debug, base_image=args.base_image, font_family=args.font)
+        assemble(
+            args.dir_path,
+            debug=args.debug,
+            base_image=args.base_image,
+            font_family=args.font,
+        )
     else:
         parser.print_help()
 
