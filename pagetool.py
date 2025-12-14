@@ -13,6 +13,8 @@ from PIL import Image, ImageDraw, ImageFont
 from docling.document_converter import DocumentConverter
 from claude_text_removal import remove_text_pil
 
+CLEANUP_PAD_PX = 3
+
 
 
 
@@ -384,11 +386,12 @@ def assemble(
                 continue
 
             # Clean the cell area before drawing text
-            crop = img.crop((cell_box.l, cell_box.t, cell_box.r, cell_box.b))
+            expanded_cell_box = _expand_box(cell_box, CLEANUP_PAD_PX, width, height)
+            crop = img.crop((expanded_cell_box.l, expanded_cell_box.t, expanded_cell_box.r, expanded_cell_box.b))
             crop.save(os.path.join(dir_path, f'temp-{temp_counter:04d}.png'))
             cleaned_crop = remove_text_pil(crop)
             cleaned_crop.save(os.path.join(dir_path, f'temp-{temp_counter:04d}-cleaned.png'))
-            img.paste(cleaned_crop, (cell_box.l, cell_box.t))
+            img.paste(cleaned_crop, (expanded_cell_box.l, expanded_cell_box.t))
             temp_counter += 1
 
             is_header = bool(cell.get("column_header") or cell.get("row_header"))
@@ -417,13 +420,14 @@ def assemble(
         if should_skip_text_box(box):
             continue
         # Extract sub-image
-        crop = img.crop((box.l, box.t, box.r, box.b))
+        expanded_box = _expand_box(box, CLEANUP_PAD_PX, width, height)
+        crop = img.crop((expanded_box.l, expanded_box.t, expanded_box.r, expanded_box.b))
         crop.save(os.path.join(dir_path, f'temp-{temp_counter:04d}.png'))
         # Clean it
         cleaned_crop = remove_text_pil(crop)
         cleaned_crop.save(os.path.join(dir_path, f'temp-{temp_counter:04d}-cleaned.png'))
         # Paste back
-        img.paste(cleaned_crop, (box.l, box.t))
+        img.paste(cleaned_crop, (expanded_box.l, expanded_box.t))
         temp_counter += 1
 
     # Draw all (non-table) texts.
@@ -514,6 +518,17 @@ def _to_int_box(bbox: dict, width: int, height: int) -> Box:
     t = _clamp(t, 0, height)
     b = _clamp(b, 0, height)
     return Box(l, t, r, b)
+
+
+def _expand_box(box: Box, pad: int, width: int, height: int) -> Box:
+    if pad <= 0:
+        return box
+    return Box(
+        _clamp(box.l - pad, 0, width),
+        _clamp(box.t - pad, 0, height),
+        _clamp(box.r + pad, 0, width),
+        _clamp(box.b + pad, 0, height),
+    )
 
 
 def _pick_font_paths(font_family: str | None = None) -> tuple[str | None, str | None]:
