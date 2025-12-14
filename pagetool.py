@@ -61,9 +61,17 @@ def disassemble(png_path: str, *, converter: DocumentConverter | None = None, ou
     output_dir = os.path.join(os.path.dirname(png_path), base_name)
     os.makedirs(output_dir, exist_ok=True)
 
-    # Save the Docling document as JSON
+    # Save the Docling document as JSON and record the coordinate origin if available.
+    doc_dict = doc.model_dump()
+    # Docling historically uses a bottom-left origin for PDF coordinates, but some
+    # inputs (e.g., PNGs) may already be in top-left pixel space. Persist any
+    # origin hint so assembly can mirror the exact convention.
+    coord_origin = getattr(doc, "coord_origin", None) or doc_dict.get("coord_origin")
+    if coord_origin:
+        doc_dict["coord_origin"] = str(coord_origin)
+
     with open(os.path.join(output_dir, 'docling.json'), 'w') as f:
-        json.dump(doc.model_dump(), f, indent=2)
+        json.dump(doc_dict, f, indent=2)
 
     # Save the original page image
     page_img = Image.open(png_path)
@@ -147,6 +155,8 @@ def assemble(
     with open(os.path.join(dir_path, 'docling.json'), 'r') as f:
         doc_data = json.load(f)
 
+    coord_origin = str(doc_data.get("coord_origin") or "BOTTOMLEFT").upper()
+
     if not doc_data.get('pages'):
         raise ValueError("No pages found in docling.json")
 
@@ -168,9 +178,9 @@ def assemble(
 
     regular_font_path, bold_font_path = _pick_font_paths(font_family)
 
-    def convert_bbox(bbox, coord_origin='BOTTOMLEFT'):
+    def convert_bbox(bbox, coord_origin=coord_origin):
         # Convert from BOTTOMLEFT to TOPLEFT coordinates
-        if coord_origin == 'BOTTOMLEFT':
+        if str(coord_origin).upper() == 'BOTTOMLEFT':
             return {
                 'l': bbox['l'],
                 't': height - bbox['t'],
